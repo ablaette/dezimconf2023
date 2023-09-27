@@ -1,0 +1,332 @@
+---
+title: "Operation Sarrazin"
+author: Andreas Blaette
+output: html_document
+date: "2023-09-27"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(polmineR)
+library(MigPress)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(xts)
+library(RColorBrewer)
+library(data.table)
+```
+
+```{r}
+sampling_queries_cqp <- MigPress::queries_qtr_checked %>% 
+  gsub("_", "", .) %>% 
+  strsplit(split = "\\+") %>% 
+  lapply(function(x) sprintf(".*%s.*", x)) %>% 
+  lapply(paste0, collapse = " ") %>% 
+  unlist() %>% 
+  as.cqp(normalise.case = TRUE)
+```
+
+```{r corpora, eval = TRUE}
+corpora <- c("NADIRAFAZ", "NADIRASZ", "NADIRATAZ")
+```
+
+```{r sample_articles, eval = FALSE}
+for (corpus_id in corpora){
+  matching_articles <- corpus(corpus_id) %>%
+    hits(query = sampling_queries_cqp, cqp = TRUE, s_attribute = "article_id") %>% 
+    as.data.frame() %>% 
+    filter(count >= 1) %>% 
+    pull(article_id) %>% 
+    unique()
+  
+  saveRDS(
+    object = matching_articles,
+    file = file.path(
+      "~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz",
+      sprintf("%s_sample.rds", corpus_id)
+    )
+  )
+}
+```
+
+```{r}
+sectionfilter <- list(
+  NADIRAFAZ = c(
+    "Politik",
+    "Wirtschaft",
+    "Gesellschaft",
+    "Leben"
+  ),
+  NADIRASZ = c(
+  "Politik",
+  "Nachrichten",
+  "Die Seite Drei",
+  "Gesellschaft",
+  "Meinungsseite",
+  "Themen des Tages",
+  "Wirtschaft"
+  ),
+  NADIRATAZ = c(
+    "Inland",
+    "Seite 1",
+    "Aktuelles",
+    "Tagesthema",
+    "Wirtschaft und Umwelt",
+    "Ausland",
+    "Meinung und Diskussion",
+    "politik"
+  )
+)
+
+newsmap <- c(
+  NADIRAFAZ = "s3://polmine/corpora/cwb/faz/nadirafaz_v0.2.1_newsmap_2023-01-19.rds",
+  NADIRASZ = "s3://polmine/corpora/cwb/sz/nadirasz_v0.2.0_newsmap_2023-01-19.rds",
+  NADIRATAZ = "s3://polmine/corpora/cwb/taz/nadirataz_v0.2.0_newsmap_2023-01-23.rds"
+) %>% 
+  lapply(aws.s3::s3readRDS, bucket = "polmine", region = "eu-central-1")
+
+
+data_report <- lapply(
+  corpora,
+  function(corpus_id){
+    x <- corpus(corpus_id)
+    
+    x_deduplicated <- x %>% 
+      subset(is_duplicate == "FALSE")
+
+    ids <- sprintf("%s_sample.rds", corpus_id) %>% 
+      file.path("~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz", .) %>% 
+      readRDS()
+    
+    x_sample <- x_deduplicated %>%
+      subset(article_id %in% ids)
+    
+    x_sectionfilter <- x_sample %>% 
+      subset(article_section %in% sectionfilter[[corpus_id]])
+    
+    de <- newsmap[[corpus_id]] %>% filter(country == "de") %>% pull(text_id)
+    x_newsmap <- x_sectionfilter %>%
+      subset(article_id %in% de)
+
+    tibble(
+      corpus = corpus_id,
+      `data acquisition` = length(s_attributes(x, "article_id")),
+      deduplicated = length(s_attributes(x_deduplicated, "article_id")),
+      `sample (QTR-based dictionary)` = length(s_attributes(x_sample, "article_id")),
+      `section filter` = length(s_attributes(x_sectionfilter, "article_id")),
+      `geographical classification` = length(s_attributes(x_newsmap, "article_id"))
+    )
+  }
+) %>% 
+  bind_rows()
+
+data_report %>% 
+  pivot_longer(cols = c(`data acquisition`,  deduplicated, `sample (QTR-based dictionary)`, `section filter`, `geographical classification`)) %>%
+  mutate(name = factor(
+    name,
+    levels = c("data acquisition",  "deduplicated", "sample (QTR-based dictionary)", "section filter", "geographical classification"))
+  ) %>% 
+  mutate(value = round(value / 1000, 2)) %>% 
+  ggplot(aes(x = corpus, y = value, fill = name)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = name)) +
+  geom_text(
+    aes(label = round(value, 0)),
+    position = position_dodge(.9),
+    vjust = -1,
+    size = 3
+  ) + 
+  ylab("number of articles (in thousands)") +
+  xlab("newspaper corpus") +
+  theme(legend.title = element_blank())
+
+ggsave(
+  "~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz/data_report.svg",
+  width = 18,
+  height = 12,
+  units = "cm"
+)
+```
+
+```{r}
+corpora_min <- lapply(
+  corpora,
+  function(corpus_id){
+    
+    ids <- sprintf("%s_sample.rds", corpus_id) %>% 
+      file.path("~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz", .) %>% 
+      readRDS()
+    
+    de_articles <- newsmap[[corpus_id]] %>%
+      filter(country == "de") %>%
+      pull(text_id)
+    
+    corpus(corpus_id) %>% 
+      subset(is_duplicate == "FALSE") %>%
+      subset(article_id %in% ids) %>% 
+      subset(article_section %in% sectionfilter[[corpus_id]]) %>% 
+      subset(article_id %in% !!de_articles)
+  }
+)
+```
+
+```{r}
+queries <- c(
+  '"Ausländer.*"',
+  '"[mM]uslim.*"',
+  '"mit" "Migrationshintergrund"',
+  '"Asyl(bewerber|suchend).*"',
+  '"Flüchtling.*"',
+  '"Geflüchtet.*"'
+)
+
+freq <- lapply(
+  corpora_min,
+  function(corpus_min){
+    lapply(
+      queries,
+      function(query){
+        corpus_min %>% 
+          hits(query = query, cqp = TRUE, s_attribute = "article_date") %>% 
+          as.data.table() %>% 
+          mutate(date = as.Date(article_date)) %>% 
+          mutate(year = floor_date(date, unit = "years")) %>% 
+          group_by(year, query) %>% 
+          summarise(count = sum(count), .groups = "rowwise") %>% 
+          mutate(corpus = get_corpus(corpus_min))
+      }
+    )
+  }
+)
+
+freq %>% 
+  bind_rows() %>% 
+  filter(year >= as.Date("2000-01-01")) %>% 
+  filter(query == '"Flüchtling.*"') %>% 
+  ggplot(aes(x = year, y = count)) +
+  geom_line(stat = "identity", aes(color = query)) +
+  scale_x_date() +
+  scale_color_manual(
+    values = RColorBrewer::brewer.pal(n = 2, name = "Set1")[2]
+  ) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(~ corpus) +
+  ylab("number of matches (absolute)")
+
+
+freq %>% 
+  bind_rows() %>% 
+  filter(year >= as.Date("2000-01-01")) %>% 
+  filter(query != '"Flüchtling.*"') %>% 
+  ggplot(aes(x = year, y = count, fill = query)) +
+  geom_line(stat = "identity", aes(color = query)) +
+  scale_x_date() +
+  scale_color_manual(
+    values = RColorBrewer::brewer.pal(n = length(queries), name = "Set1")
+  ) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(~ corpus) +
+  ylab("number of matches (absolute)")
+  
+
+freq %>% 
+  bind_rows() %>% 
+  filter(year >= as.Date("2000-01-01")) %>% 
+  mutate(
+    frequency = case_when(
+      query == '"Flüchtling.*"' ~ "high",
+      query %in% c('"Ausländer.*"', '"[mM]uslim.*"', '"Asyl(bewerber|suchend).*"') ~ "medium",
+      query %in% c('"mit" "Migrationshintergrund"',  '"Geflüchtet.*"') ~ "low"
+    )
+  ) %>% 
+  mutate(frequency = factor(frequency, levels = c("high", "medium", "low"))) %>% 
+  ggplot(aes(x = year, y = count, fill = query)) +
+  geom_line(stat = "identity", aes(color = query)) +
+  scale_x_date() +
+  scale_color_manual(
+    values = RColorBrewer::brewer.pal(n = length(queries), name = "Set1")
+  ) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(frequency ~ corpus, scales = "free_y", strip.position = "top", labeller = label_wrap_gen(multi_line = FALSE)) +
+  ylab("number of matches (absolute)")
+    
+ggsave(
+  "~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz/target_groups.svg",
+  width = 18,
+  height = 12,
+  units = "cm"
+)
+```
+
+```{r}
+stability <- lapply(
+  corpora_min,
+  function(corpus_min){
+    query <- '"[Mm]uslim.*"'
+    # query <- '"([iI]slam.*|[Mm]uslim.*)"'
+
+    dt <- lapply(
+      1987:2021,
+      function(year){
+        date_regex <- sprintf("^%s-.*?$", year)
+        sc <- corpus_min %>% 
+          subset(grepl(!!date_regex, article_date))
+        name(sc) <- year
+        sc
+      }
+    ) %>% 
+      as.bundle() %>%
+      cooccurrences(query = query, cqp = TRUE, left = 15, right = 15) %>% 
+      subset(count_coi >= 3) %>% 
+      subset(rank_ll <= 100) %>% 
+      subset(!word %in% c(punctuation, '"', "'", "*")) %>% 
+      lapply(function(x) as.data.table(x)[, "name" := x@name]) %>% 
+      rbindlist() %>% 
+      select(name, word, ll) %>% 
+      dcast(word ~ name, value.var = "ll", fill = 0)
+    
+    similarity <- sapply(
+      3L:ncol(dt),
+      function(i)
+        cor(
+          x = dt[[i]],
+          y = dt[[i - 1]],
+          use = "pairwise.complete.obs",
+          method = "kendall"
+        )
+      )
+    
+    data.table(
+      year = as.Date(sprintf("%s-01-01", colnames(m)[3L:ncol(dt)])),
+      corpus = get_corpus(corpus_min),
+      query = query,
+      change = similarity
+    )
+  }
+)
+
+stability %>% 
+  bind_rows() %>% 
+  filter(year >= as.Date("1995-01-01")) %>% 
+  ggplot(aes(x = year, y = change, fill = corpus)) +
+  geom_line(stat = "identity", aes(color = corpus)) +
+  scale_x_date(breaks = "1 years", date_labels = "%Y") +
+  scale_color_manual(
+    values = RColorBrewer::brewer.pal(n = 3, name = "Set1")
+  ) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(~ corpus, strip.position = "top", ncol = 1, nrow = 3) +
+  ylab("context similarity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+ggsave(
+  "~/Nextcloud/Org/Termine/2023-09-25_DeZIM-Konferenz/context_stability.svg",
+  width = 18,
+  height = 12,
+  units = "cm"
+)
+```
+
